@@ -1,0 +1,33 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Archivos de configuración privada
+.env
+.env.*
+!.env.example
+
+# Archivos temporales y registros
+*.log
+*.tmp
+*.bak
+
+# Pruebas y caché
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Archivos generados por PyInstaller
+build/
+dist/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
