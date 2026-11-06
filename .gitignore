@@ -31,3 +31,10 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# IDEs y editores
+.vscode/
+.idea/
+
+# Archivos de caché adicionales
+*.spec.bak

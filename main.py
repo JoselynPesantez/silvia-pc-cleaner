@@ -15,11 +15,16 @@ import time
 import shutil
 import tkinter as tk
 import webbrowser
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 from pathlib import Path
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from collections import defaultdict
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = ImageTk = None
 
 try:
     import psutil
@@ -32,7 +37,7 @@ except ImportError:
     send2trash = None
 
 APP_NAME = "SILVIA PC Cleaner"
-VERSION = "1.1.2"
+VERSION = "1.1.4"
 LARGE_FILE_MIN = 100 * 1024 * 1024
 SCAN_ROOTS = [
     Path.home() / "Desktop", Path.home() / "Documents",
@@ -203,6 +208,14 @@ class CleanerApp:
         self.programs = []
         self.row_map = {}
         self.current_filter = "Todos"
+        self.view_mode = "list"
+        self.sort_mode = "modified_desc"
+        self.thumbnail_cache = {}
+        self.gallery_images = []
+        self.gallery_items = {}
+        self.column_filters = {}
+        self.column_sort = None
+        self.checked_items = set()
         self._style()
         self._build()
         self.refresh_system()
@@ -283,7 +296,7 @@ class CleanerApp:
         self.cancel_btn.pack(side="left", padx=7)
         ttk.Button(toolbar, text="Seleccionar categoría", command=self.select_category).pack(side="left", padx=3)
         ttk.Button(toolbar, text="Limpiar selección", command=self.clear_selection).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="Enviar temporales a Papelera", command=self.delete_selected).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Enviar selección permitida a Papelera", command=self.delete_selected).pack(side="left", padx=3)
         ttk.Button(toolbar, text="Actualizar", command=self.refresh_system).pack(side="right")
 
         self.status = tk.StringVar(value="Listo. El análisis no modifica archivos.")
@@ -340,39 +353,306 @@ class CleanerApp:
     def _build_files_tab(self):
         bar = tk.Frame(self.files_tab, bg="white", padx=10, pady=9)
         bar.pack(fill="x")
+
         self.filter_var = tk.StringVar(value="Todos")
         choices = ["Todos", "Documentos", "Imágenes", "Vídeos", "Audio", "Comprimidos",
                    "Instaladores", "Otros", "Archivo grande", "Posible duplicado", "Temporales"]
         ttk.Label(bar, text="Categoría:").pack(side="left")
-        combo = ttk.Combobox(bar, textvariable=self.filter_var, values=choices, state="readonly", width=19)
-        combo.pack(side="left", padx=6)
+        combo = ttk.Combobox(bar, textvariable=self.filter_var, values=choices,
+                             state="readonly", width=16)
+        combo.pack(side="left", padx=5)
         combo.bind("<<ComboboxSelected>>", lambda _e: self.render_findings())
+
+        ttk.Label(bar, text="Ordenar:").pack(side="left", padx=(8, 2))
+        self.sort_var = tk.StringVar(value="Modificación: recientes primero")
+        sort_values = [
+            "Tamaño: menor a mayor", "Tamaño: mayor a menor",
+            "Modificación: recientes primero", "Modificación: antiguos primero",
+            "Creación: recientes primero", "Creación: antiguos primero",
+            "Nombre: A–Z", "Nombre: Z–A"
+        ]
+        sort_combo = ttk.Combobox(bar, textvariable=self.sort_var, values=sort_values,
+                                  state="readonly", width=27)
+        sort_combo.pack(side="left", padx=3)
+        sort_combo.bind("<<ComboboxSelected>>", self._sort_changed)
+
         self.category_summary = tk.StringVar(value="Aún no hay análisis.")
-        tk.Label(bar, textvariable=self.category_summary, bg="white", fg=COLORS["muted"]).pack(side="right")
+        tk.Label(bar, textvariable=self.category_summary, bg="white",
+                 fg=COLORS["muted"]).pack(side="right")
+        filters = tk.Frame(self.files_tab, bg="white", padx=10, pady=0)
+        filters.pack(fill="x", pady=(0, 7))
+        ttk.Label(filters, text="Usa las flechas de los encabezados para filtrar y ordenar, como en Excel.").pack(side="left")
+        ttk.Button(filters, text="Quitar filtros", command=self.clear_column_filters).pack(side="right", padx=(6, 0))
+        ttk.Button(filters, text="Galería", command=lambda: self.set_view("gallery")).pack(side="right", padx=(4, 0))
+        ttk.Button(filters, text="Lista", command=lambda: self.set_view("list")).pack(side="right")
 
         frame = tk.Frame(self.files_tab, bg="white", padx=10, pady=4)
         frame.pack(fill="both", expand=True)
-        cols = ("category", "name", "size", "priority", "modified", "created", "path")
+        cols = ("check", "category", "name", "size", "priority", "modified", "created", "path")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
-        headers = [
-            ("category", "Categoría", 115), ("name", "Nombre", 180), ("size", "Tamaño", 90),
-            ("priority", "Revisión", 90), ("modified", "Modificado", 130),
-            ("created", "Creado", 130), ("path", "Ubicación", 390),
-        ]
+        headers = [("check", "✓", 42), ("category", "Categoría  ▾", 125),
+                   ("name", "Nombre  ▾", 210), ("size", "Tamaño  ▾", 105),
+                   ("priority", "Revisión  ▾", 100), ("modified", "Modificado  ▾", 150),
+                   ("created", "Creado  ▾", 150), ("path", "Ubicación  ▾", 420)]
         for col, label, width in headers:
-            self.tree.heading(col, text=label)
-            self.tree.column(col, width=width, anchor="w")
+            self.tree.heading(col, text=label, command=lambda c=col: self._open_column_filter(c) if c != "check" else self._toggle_all_visible())
+            self.tree.column(col, width=width, anchor="center" if col == "check" else "w", stretch=(col == "path"))
+        self.tree.bind("<Button-1>", self._tree_checkbox_click, add="+")
         self.tree.tag_configure("high", foreground=COLORS["red"])
         self.tree.tag_configure("medium", foreground=COLORS["orange"])
         self.tree.tag_configure("low", foreground=COLORS["green"])
-        y = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.bind("<Double-1>", self._tree_double_click)
+        self.tree_scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         x = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+        self.tree.configure(yscrollcommand=self.tree_scroll.set, xscrollcommand=x.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
-        y.grid(row=0, column=1, sticky="ns")
+        self.tree_scroll.grid(row=0, column=1, sticky="ns")
         x.grid(row=1, column=0, sticky="ew")
+
+        self.gallery_canvas = tk.Canvas(frame, bg="white", highlightthickness=0)
+        self.gallery_scroll = ttk.Scrollbar(frame, orient="vertical", command=self.gallery_canvas.yview)
+        self.gallery_canvas.configure(yscrollcommand=self.gallery_scroll.set)
+        self.gallery_inner = tk.Frame(self.gallery_canvas, bg="white")
+        self.gallery_window = self.gallery_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
+        self.gallery_inner.bind("<Configure>", lambda _e: self.gallery_canvas.configure(
+            scrollregion=self.gallery_canvas.bbox("all")))
+        self.gallery_canvas.bind("<Configure>", lambda e: self.gallery_canvas.itemconfigure(
+            self.gallery_window, width=e.width))
+        self.gallery_canvas.grid(row=0, column=0, sticky="nsew")
+        self.gallery_scroll.grid(row=0, column=1, sticky="ns")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
+        self.set_view("list")
+
+    def _sort_changed(self, _event=None):
+        labels = {
+            "Tamaño: menor a mayor": "size_asc",
+            "Tamaño: mayor a menor": "size_desc",
+            "Modificación: recientes primero": "modified_desc",
+            "Modificación: antiguos primero": "modified_asc",
+            "Creación: recientes primero": "created_desc",
+            "Creación: antiguos primero": "created_asc",
+            "Nombre: A–Z": "name_asc",
+            "Nombre: Z–A": "name_desc",
+        }
+        self.sort_mode = labels.get(self.sort_var.get(), "modified_desc")
+        self.render_findings()
+
+    def _tree_checkbox_click(self, event):
+        if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.identify_column(event.x) == "#1":
+            iid = self.tree.identify_row(event.y)
+            if iid:
+                if iid in self.checked_items: self.checked_items.remove(iid)
+                else: self.checked_items.add(iid)
+                self._update_checkbox(iid)
+            return "break"
+
+    def _update_checkbox(self, iid):
+        if self.tree.exists(iid):
+            values = list(self.tree.item(iid, "values"))
+            if values:
+                values[0] = "☑" if iid in self.checked_items else "☐"
+                self.tree.item(iid, values=values)
+
+    def _toggle_all_visible(self):
+        ids = list(self.tree.get_children())
+        select_all = not ids or not all(i in self.checked_items for i in ids)
+        for iid in ids:
+            (self.checked_items.add if select_all else self.checked_items.discard)(iid)
+            self._update_checkbox(iid)
+
+    def _open_column_filter(self, column):
+        labels = {"category":"Categoría", "name":"Nombre", "size":"Tamaño", "priority":"Revisión", "modified":"Modificado", "created":"Creado", "path":"Ubicación"}
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="Ordenar ascendente", command=lambda c=column: self._sort_column(c, False))
+        menu.add_command(label="Ordenar descendente", command=lambda c=column: self._sort_column(c, True))
+        menu.add_separator()
+        if column == "name":
+            menu.add_command(label="Buscar texto…", command=self._prompt_name_filter)
+        elif column == "size":
+            menu.add_command(label="Filtrar rango de MB…", command=self._prompt_size_filter)
+        elif column in ("modified", "created"):
+            menu.add_command(label="Últimos 7 días", command=lambda c=column: self._date_quick_filter(c, 7))
+            menu.add_command(label="Últimos 30 días", command=lambda c=column: self._date_quick_filter(c, 30))
+            menu.add_command(label="Últimos 12 meses", command=lambda c=column: self._date_quick_filter(c, 365))
+        values = self._column_values(column)
+        if values:
+            submenu = tk.Menu(menu, tearoff=False)
+            for value in values[:60]:
+                submenu.add_command(label=str(value)[:65], command=lambda c=column, v=value: self._set_column_filter(c, v))
+            menu.add_cascade(label="Filtrar por valor", menu=submenu)
+        menu.add_separator()
+        menu.add_command(label="Quitar filtro de esta columna", command=lambda c=column: self._clear_one_filter(c))
+        menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        menu.grab_release()
+
+    def _column_values(self, column):
+        vals = set()
+        for f in self.findings:
+            value = {"category":f.category, "priority":f.priority, "modified":stamp(f.modified),
+                     "created":stamp(f.created), "path":str(f.path.parent), "name":f.path.name,
+                     "size":human_size(f.size)}.get(column)
+            if value is not None: vals.add(value)
+        return sorted(vals, key=lambda x: str(x).casefold())
+
+    def _sort_column(self, column, descending):
+        self.column_sort = (column, descending)
+        self.render_findings()
+
+    def _set_column_filter(self, column, value):
+        self.column_filters[column] = value; self.render_findings()
+
+    def _clear_one_filter(self, column):
+        self.column_filters.pop(column, None); self.render_findings()
+
+    def clear_column_filters(self):
+        self.column_filters.clear(); self.render_findings()
+
+    def _prompt_name_filter(self):
+        value = simpledialog.askstring(APP_NAME, "Mostrar nombres que contengan:", parent=self.root)
+        if value is not None:
+            self.column_filters["name_contains"] = value.strip().casefold(); self.render_findings()
+
+    def _prompt_size_filter(self):
+        low = simpledialog.askstring(APP_NAME, "Tamaño mínimo en MB (vacío = sin mínimo):", parent=self.root)
+        if low is None: return
+        high = simpledialog.askstring(APP_NAME, "Tamaño máximo en MB (vacío = sin máximo):", parent=self.root)
+        if high is None: return
+        try:
+            lo = float(low) if low.strip() else None; hi = float(high) if high.strip() else None
+            if lo is not None and hi is not None and lo > hi: raise ValueError
+        except ValueError:
+            messagebox.showwarning(APP_NAME, "Introduce un rango válido en MB."); return
+        self.column_filters["size_min"] = lo; self.column_filters["size_max"] = hi; self.render_findings()
+
+    def _date_quick_filter(self, column, days):
+        self.column_filters[f"{column}_days"] = days; self.render_findings()
+
+    def set_view(self, mode):
+        self.view_mode = mode
+        if mode == "gallery":
+            self.tree.grid_remove()
+            self.tree_scroll.grid_remove()
+            self.gallery_canvas.grid()
+            self.gallery_scroll.grid()
+            self._render_gallery()
+        else:
+            self.gallery_canvas.grid_remove()
+            self.gallery_scroll.grid_remove()
+            self.tree.grid()
+            self.tree_scroll.grid()
+        self._update_scroll_region()
+
+    def _visible_image_items(self):
+        return [(iid, item) for iid, item in self.row_map.items()
+                if item.category == "Imágenes"]
+
+    def _thumbnail(self, item, size=(132, 100)):
+        if Image is None or ImageTk is None:
+            return None
+        key = (str(item.path), item.modified, item.size, size)
+        if key in self.thumbnail_cache:
+            return self.thumbnail_cache[key]
+        try:
+            with Image.open(item.path) as source:
+                source.thumbnail(size)
+                image = Image.new("RGB", size, "white")
+                if source.mode in ("RGBA", "LA"):
+                    rgba = source.convert("RGBA")
+                    image.paste(rgba, ((size[0]-rgba.width)//2, (size[1]-rgba.height)//2), rgba)
+                else:
+                    source = source.convert("RGB")
+                    image.paste(source, ((size[0]-source.width)//2, (size[1]-source.height)//2))
+            photo = ImageTk.PhotoImage(image)
+            self.thumbnail_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+
+    def _render_gallery(self):
+        for child in self.gallery_inner.winfo_children():
+            child.destroy()
+        self.gallery_images.clear()
+        self.gallery_items.clear()
+        images = self._visible_image_items()
+        if not images:
+            message = "Selecciona la categoría Imágenes para ver las fotografías."
+            tk.Label(self.gallery_inner, text=message, bg="white", fg=COLORS["muted"],
+                     font=("Segoe UI", 10)).pack(anchor="w", padx=15, pady=15)
+            return
+        if Image is None:
+            tk.Label(self.gallery_inner,
+                     text="Para mostrar miniaturas instala Pillow: pip install Pillow",
+                     bg="white", fg=COLORS["orange"], font=("Segoe UI", 10)).pack(anchor="w", padx=15, pady=15)
+            return
+        width = max(self.gallery_canvas.winfo_width(), 500)
+        columns = max(2, min(6, width // 190))
+        for index, (iid, item) in enumerate(images):
+            card = tk.Frame(self.gallery_inner, bg="#FAF8FC", highlightbackground=COLORS["line"],
+                            highlightthickness=1, padx=8, pady=8)
+            card.grid(row=index // columns, column=index % columns, padx=7, pady=7, sticky="n")
+            photo = self._thumbnail(item)
+            if photo:
+                self.gallery_images.append(photo)
+                picture = tk.Label(card, image=photo, bg="white", cursor="hand2")
+            else:
+                picture = tk.Label(card, text="Vista previa no disponible", width=18, height=6,
+                                   bg="#EEE8F4", fg=COLORS["muted"], cursor="hand2")
+            picture.pack()
+            name = tk.Label(card, text=item.path.name[:24], bg="#FAF8FC",
+                            fg=COLORS["ink"], wraplength=150)
+            name.pack(anchor="w", pady=(5, 0))
+            details = tk.Label(card, text=f"{human_size(item.size)} · {stamp(item.modified)}",
+                               bg="#FAF8FC", fg=COLORS["muted"], font=("Segoe UI", 8))
+            details.pack(anchor="w")
+            for widget in (card, picture, name, details):
+                widget.bind("<Button-1>", lambda _e, row=iid: self._toggle_gallery_selection(row))
+                widget.bind("<Double-Button-1>", lambda _e, row=iid: self._open_preview(row))
+            self.gallery_items[iid] = card
+
+    def _toggle_gallery_selection(self, iid):
+        selected = set(self.tree.selection())
+        if iid in selected:
+            selected.remove(iid); self.checked_items.discard(iid)
+        else:
+            selected.add(iid); self.checked_items.add(iid)
+        self.tree.selection_set(list(selected)); self._update_checkbox(iid)
+        card = self.gallery_items.get(iid)
+        if card:
+            card.configure(highlightbackground=COLORS["purple"] if iid in selected else COLORS["line"],
+                           highlightthickness=2 if iid in selected else 1)
+
+    def _tree_double_click(self, _event=None):
+        selected = self.tree.selection()
+        if selected:
+            self._open_preview(selected[0])
+
+    def _open_preview(self, iid):
+        item = self.row_map.get(iid)
+        if not item or item.category != "Imágenes":
+            return
+        if Image is None or ImageTk is None:
+            messagebox.showinfo(APP_NAME, "La vista previa requiere Pillow. Instálalo con: pip install Pillow")
+            return
+        try:
+            with Image.open(item.path) as source:
+                source.load()
+                source.thumbnail((1000, 700))
+                preview = ImageTk.PhotoImage(source.copy())
+        except Exception as exc:
+            messagebox.showwarning(APP_NAME, f"No se pudo abrir la imagen.\\n{exc}")
+            return
+        window = tk.Toplevel(self.root)
+        window.title(f"Vista previa · {item.path.name}")
+        window.geometry("900x760")
+        window.configure(bg=COLORS["bg"])
+        image_label = tk.Label(window, image=preview, bg=COLORS["bg"])
+        image_label.image = preview
+        image_label.pack(fill="both", expand=True, padx=12, pady=12)
+        info = tk.Label(window,
+                        text=f"{item.path.name}  ·  {human_size(item.size)}  ·  Modificado: {stamp(item.modified)}\\n{item.path}",
+                        bg=COLORS["bg"], fg=COLORS["ink"], justify="left", wraplength=850)
+        info.pack(fill="x", padx=14, pady=(0, 12))
 
     def _build_programs_tab(self):
         top = tk.Frame(self.programs_tab, bg="white", padx=12, pady=10)
@@ -415,6 +695,7 @@ class CleanerApp:
             return
         self.findings = []
         self.row_map.clear()
+        self.checked_items.clear()
         for row in self.tree.get_children():
             self.tree.delete(row)
         self.cancel = threading.Event()
@@ -580,22 +861,49 @@ class CleanerApp:
                 f.priority = "Baja"
 
     def render_findings(self):
-        for row in self.tree.get_children():
-            self.tree.delete(row)
+        for row in self.tree.get_children(): self.tree.delete(row)
         self.row_map.clear()
-        selected = self.filter_var.get()
-        counts = defaultdict(int)
+        selected = self.filter_var.get(); counts = defaultdict(int); now = datetime.now(); visible = []
         for idx, item in enumerate(self.findings):
             counts[item.category] += 1
-            if selected != "Todos" and item.category != selected:
-                continue
-            iid = str(idx)
-            self.row_map[iid] = item
-            tag = {"Alta": "high", "Media": "medium", "Baja": "low"}.get(item.priority, "")
-            self.tree.insert("", "end", iid=iid, values=(
-                item.category, item.path.name, human_size(item.size), item.priority,
-                stamp(item.modified), stamp(item.created), str(item.path)), tags=(tag,))
-        self.category_summary.set("  ·  ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "Sin resultados")
+            f = self.column_filters
+            if selected != "Todos" and item.category != selected: continue
+            if "category" in f and item.category != f["category"]: continue
+            if "priority" in f and item.priority != f["priority"]: continue
+            if "path" in f and str(item.path.parent) != f["path"]: continue
+            if "name" in f and item.path.name != f["name"]: continue
+            if f.get("name_contains") and f["name_contains"] not in item.path.name.casefold(): continue
+            if "size" in f and human_size(item.size) != f["size"]: continue
+            if f.get("size_min") is not None and item.size < f["size_min"] * 1048576: continue
+            if f.get("size_max") is not None and item.size > f["size_max"] * 1048576: continue
+            if "modified" in f and stamp(item.modified) != f["modified"]: continue
+            if "created" in f and stamp(item.created) != f["created"]: continue
+            if "modified_days" in f and (now - datetime.fromtimestamp(item.modified)).days > f["modified_days"]: continue
+            if "created_days" in f and (now - datetime.fromtimestamp(item.created)).days > f["created_days"]: continue
+            visible.append((idx, item))
+        sorters = {"size_asc":lambda x:x[1].size, "size_desc":lambda x:-x[1].size,
+                   "modified_asc":lambda x:x[1].modified, "modified_desc":lambda x:-x[1].modified,
+                   "created_asc":lambda x:x[1].created, "created_desc":lambda x:-x[1].created,
+                   "name_asc":lambda x:x[1].path.name.casefold(), "name_desc":lambda x:x[1].path.name.casefold()}
+        if self.column_sort:
+            col, desc = self.column_sort
+            key_map = {"category": lambda x: x[1].category.casefold(),
+                       "name": lambda x: x[1].path.name.casefold(),
+                       "size": lambda x: x[1].size,
+                       "priority": lambda x: x[1].priority.casefold(),
+                       "modified": lambda x: x[1].modified,
+                       "created": lambda x: x[1].created,
+                       "path": lambda x: str(x[1].path).casefold()}
+            visible.sort(key=key_map.get(col, lambda x: x[1].modified), reverse=desc)
+        else:
+            visible.sort(key=sorters.get(self.sort_mode, sorters["modified_desc"]), reverse=self.sort_mode == "name_desc")
+        for idx, item in visible:
+            iid=str(idx); self.row_map[iid]=item
+            checked="☑" if iid in self.checked_items else "☐"
+            tag={"Alta":"high", "Media":"medium", "Baja":"low"}.get(item.priority, "")
+            self.tree.insert("", "end", iid=iid, values=(checked,item.category,item.path.name,human_size(item.size),item.priority,stamp(item.modified),stamp(item.created),str(item.path)),tags=(tag,))
+        self.category_summary.set("  ·  ".join(f"{k}: {v}" for k,v in sorted(counts.items())) or "Sin resultados")
+        if self.view_mode == "gallery": self._render_gallery()
 
     def select_category(self):
         category = self.filter_var.get()
@@ -603,37 +911,57 @@ class CleanerApp:
             messagebox.showinfo(APP_NAME, "Elige primero una categoría en el filtro.")
             return
         ids = [iid for iid, item in self.row_map.items() if item.category == category]
+        self.checked_items.update(ids)
+        for iid in ids: self._update_checkbox(iid)
         self.tree.selection_set(ids)
 
     def clear_selection(self):
-        self.tree.selection_remove(self.tree.selection())
+        self.checked_items.clear(); self.tree.selection_remove(self.tree.selection())
+        for iid in self.tree.get_children(): self._update_checkbox(iid)
+        for card in self.gallery_items.values(): card.configure(highlightbackground=COLORS["line"], highlightthickness=1)
 
     def delete_selected(self):
-        chosen = [self.row_map[i] for i in self.tree.selection() if i in self.row_map]
+        selected_ids = set(self.checked_items) | set(self.tree.selection())
+        chosen = [self.row_map[i] for i in selected_ids if i in self.row_map]
         if not chosen:
-            messagebox.showinfo(APP_NAME, "Selecciona elementos de la lista.")
+            messagebox.showinfo(APP_NAME, "Selecciona elementos de la lista o de la galería.")
             return
-        # Only temporary/cache files can be moved to Recycle Bin.
         approved = [p for _, p in cache_folders()]
-        deletable = [f for f in chosen if f.category == "Temporales" and any(inside(f.path, p) for p in approved)]
+        deletable = [f for f in chosen if
+                     (f.category == "Temporales" and any(inside(f.path, p) for p in approved))
+                     or (f.category == "Imágenes" and f.path.suffix.lower() in CATEGORY_EXTENSIONS["Imágenes"])]
+        blocked = len(chosen) - len(deletable)
         if not deletable:
-            messagebox.showinfo(APP_NAME, "Esta selección es informativa. Solo los temporales/cachés aprobados pueden enviarse a Papelera.")
+            messagebox.showinfo(APP_NAME, "Esta selección es informativa. Solo los temporales/cachés aprobados y las imágenes seleccionadas pueden enviarse a Papelera.")
             return
         if not send2trash:
-            messagebox.showerror(APP_NAME, "Falta send2trash. Instálalo con: pip install send2trash")
+            messagebox.showerror(APP_NAME, "Falta send2trash. Instálalo con: pip install Send2Trash")
             return
         total = sum(f.size for f in deletable)
-        if not messagebox.askyesno(APP_NAME, f"Se enviarán {len(deletable)} archivos ({human_size(total)}) a la Papelera. ¿Continuar?"):
+        image_count = sum(1 for f in deletable if f.category == "Imágenes")
+        temp_count = len(deletable) - image_count
+        detail = []
+        if image_count:
+            detail.append(f"{image_count} imágenes")
+        if temp_count:
+            detail.append(f"{temp_count} temporales/cachés")
+        warning = (f"Se enviarán {len(deletable)} elementos ({', '.join(detail)}; {human_size(total)}) "
+                   "a la Papelera de Windows. Podrás restaurarlos desde la Papelera mientras no la vacíes.")
+        if blocked:
+            warning += f"\\n{blocked} elementos informativos no se modificarán."
+        if not messagebox.askyesno(APP_NAME, warning + "\\n\\n¿Continuar?"):
             return
         moved, errors = 0, 0
         for f in deletable:
             try:
-                if f.path.exists() and f.path.is_file() and any(inside(f.path, p) for p in approved):
+                allowed = (f.category == "Imágenes" and f.path.suffix.lower() in CATEGORY_EXTENSIONS["Imágenes"])
+                allowed = allowed or (f.category == "Temporales" and any(inside(f.path, p) for p in approved))
+                if allowed and f.path.exists() and f.path.is_file():
                     send2trash(str(f.path))
                     moved += 1
             except Exception:
                 errors += 1
-        messagebox.showinfo(APP_NAME, f"Enviados a Papelera: {moved}\nNo procesados: {errors}")
+        messagebox.showinfo(APP_NAME, f"Enviados a Papelera: {moved}\\nNo procesados: {errors}")
         self.start_scan()
 
     def show_privacy(self):
@@ -650,7 +978,7 @@ class CleanerApp:
         tk.Label(heading, text="Política de privacidad",
                  bg=COLORS["purple"], fg="white",
                  font=("Segoe UI", 17, "bold")).pack(anchor="w")
-        tk.Label(heading, text="SILVIA PC Cleaner 1.1.2 · Última actualización: noviembre de 2026",
+        tk.Label(heading, text="SILVIA PC Cleaner 1.1.4 · Última actualización: noviembre de 2026",
                  bg=COLORS["purple"], fg="#F0E8F8",
                  font=("Segoe UI", 9)).pack(anchor="w", pady=(3, 0))
 
@@ -667,7 +995,7 @@ El análisis se realiza localmente en el equipo. La aplicación consulta metadat
 SILVIA PC Cleaner no recopila ni transmite información personal a SILVIA PRO. El código de esta versión no implementa cuentas de usuario, publicidad, telemetría, servidores propios ni envío de archivos o informes. Los resultados del análisis se mantienen en memoria durante la sesión de la aplicación.
 
 3. Acceso a archivos y cambios
-La aplicación examina ubicaciones locales para generar el diagnóstico. Los archivos personales, archivos grandes y posibles duplicados se muestran con fines informativos y no se eliminan desde la aplicación. La función de limpieza se limita a elementos temporales y cachés de ubicaciones aprobadas, y solicita confirmación antes de enviarlos a la Papelera de reciclaje.
+La aplicación examina ubicaciones locales para generar el diagnóstico. Los archivos personales, archivos grandes y posibles duplicados se muestran con fines informativos. Las imágenes pueden seleccionarse y enviarse a la Papelera de reciclaje tras una confirmación explícita. La función de limpieza también permite elementos temporales y cachés de ubicaciones aprobadas. Los archivos enviados a la Papelera pueden restaurarse mientras esta no se vacíe.
 
 4. Conexión a Internet
 El análisis y las funciones principales no requieren conexión a Internet. El enlace al sitio web de SILVIA PRO solo se abre si el usuario hace clic en él.
